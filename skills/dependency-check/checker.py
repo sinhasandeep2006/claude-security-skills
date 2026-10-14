@@ -453,15 +453,20 @@ def check_online_osv(deps: list[Dep], timeout: float = 10.0) -> list[Finding]:
                 if vuln.get("id"):
                     hits.append((dep, vuln["id"]))
 
-    details: dict[str, dict] = {}
+    def detail(vid: str) -> dict:
+        try:
+            return _osv(f"https://api.osv.dev/v1/vulns/{vid}", timeout=timeout)
+        except Exception:
+            return {}
+
+    # One GET per advisory; sequentially a mid-sized lockfile takes minutes.
+    from concurrent.futures import ThreadPoolExecutor
+    ids = list(dict.fromkeys(vid for _, vid in hits))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        details = dict(zip(ids, pool.map(detail, ids)))
+
     findings: list[Finding] = []
     for dep, vid in hits:
-        if vid not in details:
-            try:
-                details[vid] = _osv(f"https://api.osv.dev/v1/vulns/{vid}",
-                                    timeout=timeout)
-            except Exception:
-                details[vid] = {}
         vuln = details[vid]
         findings.append(Finding(dep.ecosystem, dep.name, dep.version, vid,
                                 _osv_severity(vuln),
