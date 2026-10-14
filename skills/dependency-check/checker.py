@@ -56,6 +56,7 @@ class Finding:
     id: str
     severity: str
     summary: str
+    via: str | None = None  # chain that pulled a transitive dependency in
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -119,6 +120,7 @@ class Dep:
     version: str | None
     raw: str
     pinned: bool
+    via: str | None = None
 
 def _parse_dependency_token(text: str) -> tuple[str | None, str | None, bool] | None:
     token = text.split(";", 1)[0].strip()
@@ -255,6 +257,155 @@ def parse_go_mod(text: str) -> list[Dep]:
 
     return deps
 
+def _chains(graph: dict, roots: list) -> dict:
+    """Shortest chain of ancestors from a root to every reachable node (BFS)."""
+    chains = {r: [] for r in roots if r in graph}
+    queue = list(chains)
+    for node in queue:
+        for child in graph[node]:
+            if child not in chains:
+                chains[child] = chains[node] + [node]
+                queue.append(child)
+    return chains
+
+def _npm_name(path: str) -> str:
+    return path.rsplit("node_modules/", 1)[-1]
+
+def _npm_resolve(packages: dict, parent: str, name: str) -> str | None:
+    # Node's lookup: parent/node_modules/name, then each ancestor's, then the root.
+    while True:
+        candidate = (parent + "/" if parent else "") + "node_modules/" + name
+        if candidate in packages:
+            return candidate
+        if not parent:
+            return None
+        parent = (parent.rsplit("/node_modules/", 1)[0]
+                  if "/node_modules/" in parent else "")
+
+def _npm_v1_to_packages(deps: dict, parent: str = "",
+                        out: dict | None = None) -> dict:
+    out = {} if out is None else out
+    for name, meta in deps.items():
+        if not isinstance(meta, dict):
+            continue
+        path = (parent + "/" if parent else "") + "node_modules/" + name
+        out[path] = {"version": meta.get("version"),
+                     "dependencies": meta.get("requires") or {}}
+        _npm_v1_to_packages(meta.get("dependencies") or {}, path, out)
+    return out
+
+def parse_package_lock(text: str) -> list[Dep]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    packages = data.get("packages")
+    if isinstance(packages, dict):
+        packages = {k: v for k, v in packages.items()
+                    if isinstance(v, dict) and (k == "" or "node_modules/" in k)}
+    else:
+        packages = _npm_v1_to_packages(data.get("dependencies") or {})
+    root = packages.pop("", None)
+    if root is None:
+        # ponytail: v1 never lists the root's own deps, so a top-level package
+        # nobody requires is treated as direct. One that is both direct and
+        # required elsewhere is reported with a "via"; read package.json if
+        # that matters.
+        required = {n for m in packages.values()
+                    for n in (m.get("dependencies") or {})}
+        root = {"dependencies": {_npm_name(p): "" for p in packages
+                                 if p.count("node_modules/") == 1
+                                 and _npm_name(p) not in required}}
+
+    graph = {"": []}
+    for path, meta in list(packages.items()) + [("", root)]:
+        names = {}
+        for section in ("dependencies", "optionalDependencies",
+                        "peerDependencies", "devDependencies"):
+            names.update(meta.get(section) or {})
+        graph[path] = [p for p in (_npm_resolve(packages, path, n) for n in names)
+                       if p]
+    chains = _chains(graph, [""])
+
+    deps: list[Dep] = []
+    seen = set()
+    # Reachable packages first, in BFS order, so the shortest chain wins a dedupe.
+    order = [p for p in chains if p] + [p for p in packages if p not in chains]
+    for path in order:
+        meta = packages[path]
+        name, version = _npm_name(path).lower(), meta.get("version")
+        if not version or (name, version) in seen:
+            continue
+        seen.add((name, version))
+        if path in chains:
+            via = [_npm_name(p) for p in chains[path] if p]
+        else:  # unreachable (extraneous): fall back to where it is installed
+            via = path.split("node_modules/")[1:-1]
+            via = [v.rstrip("/") for v in via]
+        deps.append(Dep("npm", name, version, f"{path}@{version}", True,
+                        " > ".join(via) or None))
+    return deps
+
+def _pep503(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+def _read_poetry_lock(text: str) -> list[dict]:
+    """Python < 3.11 has no tomllib; poetry.lock only needs a tiny TOML subset:
+    [[package]] tables with name/version and a [package.dependencies] table."""
+    pkgs: list[dict] = []
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            section = line.strip("[] ")
+            if line == "[[package]]":
+                pkgs.append({"dependencies": {}})
+            continue
+        m = re.match(r'^"?([A-Za-z0-9_.\-]+)"?\s*=\s*(.*)$', line)
+        if not m or not pkgs:
+            continue
+        key, value = m.groups()
+        if section == "package" and key in ("name", "version"):
+            pkgs[-1][key] = value.strip().strip('"\'')
+        elif section == "package.dependencies":
+            pkgs[-1]["dependencies"][key] = value
+    return pkgs
+
+def parse_poetry_lock(text: str) -> list[Dep]:
+    try:
+        import tomllib
+        try:
+            pkgs = tomllib.loads(text).get("package") or []
+        except Exception:
+            return []
+    except ImportError:
+        pkgs = _read_poetry_lock(text)
+
+    graph: dict[str, list[str]] = {}
+    versions: dict[str, str] = {}
+    for pkg in pkgs:
+        if not isinstance(pkg, dict) or not pkg.get("name"):
+            continue
+        name = _pep503(pkg["name"])
+        versions.setdefault(name, str(pkg.get("version") or ""))
+        graph[name] = [_pep503(d) for d in (pkg.get("dependencies") or {})]
+    for children in graph.values():
+        children[:] = [c for c in children if c in graph]
+    # ponytail: poetry.lock does not record which packages are direct, so a
+    # package nobody depends on is a root. Read pyproject.toml if a package
+    # that is both direct and transitive must not show a "via".
+    depended = {c for children in graph.values() for c in children}
+    chains = _chains(graph, [n for n in graph if n not in depended])
+
+    deps: list[Dep] = []
+    for name in graph:
+        if not versions[name]:
+            continue
+        via = " > ".join(chains.get(name, [])) or None
+        deps.append(Dep("pypi", name, versions[name],
+                        f"{name}=={versions[name]}", True, via))
+    return deps
+
 def check_offline(deps: list[Dep]) -> list[Finding]:
     findings: list[Finding] = []
     for dep in deps:
@@ -264,35 +415,57 @@ def check_offline(deps: list[Dep]) -> list[Finding]:
         for spec, cve, sev, summary in eco_db.get(dep.name, []):
             if version_matches(dep.version, spec):
                 findings.append(Finding(dep.ecosystem, dep.name, dep.version,
-                                        cve, sev, summary))
+                                        cve, sev, summary, dep.via))
     findings.sort(key=lambda f: SEV_RANK.get(f.severity, 9))
     return findings
 
-def check_online_osv(deps: list[Dep], timeout: float = 10.0) -> list[Finding]:
+OSV_BATCH = 1000  # OSV.dev's limit on queries per /v1/querybatch request
+
+def _osv(url: str, body: dict | None = None, timeout: float = 10.0) -> dict:
     import urllib.request
 
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+def check_online_osv(deps: list[Dep], timeout: float = 10.0) -> list[Finding]:
     eco_map = {"pypi": "PyPI", "npm": "npm", "go": "Go"}
-    findings: list[Finding] = []
-    for dep in deps:
-        if not dep.version:
-            continue
-        body = json.dumps({
-            "version": dep.version,
-            "package": {"name": dep.name, "ecosystem": eco_map[dep.ecosystem]},
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.osv.dev/v1/query", data=body,
-            headers={"Content-Type": "application/json"})
+    deps = [d for d in deps if d.version]
+    # Batch queries only return vuln IDs; details are fetched once per ID.
+    hits: list[tuple[Dep, str]] = []
+    for i in range(0, len(deps), OSV_BATCH):
+        chunk = deps[i:i + OSV_BATCH]
+        queries = [{"version": d.version,
+                    "package": {"name": d.name,
+                                "ecosystem": eco_map[d.ecosystem]}}
+                   for d in chunk]
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read())
+            data = _osv("https://api.osv.dev/v1/querybatch",
+                        {"queries": queries}, timeout)
         except Exception:
             continue
-        for vuln in data.get("vulns", []):
-            sev = _osv_severity(vuln)
-            findings.append(Finding(dep.ecosystem, dep.name, dep.version,
-                                    vuln.get("id", "OSV"), sev,
-                                    (vuln.get("summary") or "")[:200]))
+        # ponytail: ignores next_page_token, which OSV only sets when a single
+        # package has more vulns than fit in one page; follow it if that bites.
+        for dep, result in zip(chunk, data.get("results") or []):
+            for vuln in (result or {}).get("vulns") or []:
+                if vuln.get("id"):
+                    hits.append((dep, vuln["id"]))
+
+    details: dict[str, dict] = {}
+    findings: list[Finding] = []
+    for dep, vid in hits:
+        if vid not in details:
+            try:
+                details[vid] = _osv(f"https://api.osv.dev/v1/vulns/{vid}",
+                                    timeout=timeout)
+            except Exception:
+                details[vid] = {}
+        vuln = details[vid]
+        findings.append(Finding(dep.ecosystem, dep.name, dep.version, vid,
+                                _osv_severity(vuln),
+                                (vuln.get("summary") or "")[:200], dep.via))
     findings.sort(key=lambda f: SEV_RANK.get(f.severity, 9))
     return findings
 
@@ -322,6 +495,10 @@ def parse_file(path: str) -> list[Dep]:
     with open(path, "r", encoding="utf-8", errors="ignore") as fh:
         text = fh.read()
     base = os.path.basename(path).lower()
+    if base == "package-lock.json":
+        return parse_package_lock(text)
+    if base == "poetry.lock":
+        return parse_poetry_lock(text)
     if base == "package.json":
         return parse_package_json(text)
     if base == "pyproject.toml":
@@ -332,22 +509,40 @@ def parse_file(path: str) -> list[Dep]:
         return parse_requirements(text)
     return parse_requirements(text)
 
+# Lockfiles come first so their exact versions win the dedupe in run().
+LOCKFILES_REPLACE = {"package-lock.json": "package.json",
+                     "poetry.lock": "pyproject.toml"}
+LOCKFILES = tuple(LOCKFILES_REPLACE)
+
 def discover(path: str) -> list[str]:
     if os.path.isfile(path):
         return [path]
     found = []
-    for name in ("requirements.txt", "package.json", "pyproject.toml", "go.mod"):
+    for name in LOCKFILES + ("requirements.txt", "package.json",
+                             "pyproject.toml", "go.mod"):
         candidate = os.path.join(path, name)
         if os.path.isfile(candidate):
             found.append(candidate)
+    # The lockfile records what is installed; its manifest only what was asked.
+    for lock, manifest in LOCKFILES_REPLACE.items():
+        if os.path.join(path, lock) in found:
+            found = [f for f in found if f != os.path.join(path, manifest)]
     return found
 
 def run(path: str, online: bool = False, show_unpinned: bool = True,
         min_severity: str = "info") -> dict:
     files = discover(path)
     deps: list[Dep] = []
+    locked: set[tuple[str, str]] = set()
     for f in files:
-        deps.extend(parse_file(f))
+        is_lock = os.path.basename(f).lower() in LOCKFILES
+        for dep in parse_file(f):
+            # e.g. requirements.txt next to poetry.lock: the lock already has it.
+            if not is_lock and (dep.ecosystem, dep.name) in locked:
+                continue
+            if is_lock:
+                locked.add((dep.ecosystem, dep.name))
+            deps.append(dep)
     findings = check_offline(deps)
     if online:
         findings.extend(check_online_osv(deps))
@@ -365,7 +560,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="dependency-check",
         description="Check dependencies for known vulns and risky pinning.")
-    p.add_argument("path", help="requirements.txt, package.json, or a directory")
+    p.add_argument("path", help="a manifest, a lockfile, or a directory")
     p.add_argument("--online", action="store_true",
                    help="also query the OSV.dev advisory API (network)")
     p.add_argument("--no-unpinned", action="store_true",
@@ -398,8 +593,9 @@ def main(argv: list[str] | None = None) -> int:
         if vulns:
             print(f"Known vulnerabilities ({len(vulns)}):")
             for v in vulns:
+                via = f" (via {v['via']})" if v.get("via") else ""
                 print(f"  [{v['severity'].upper():<8}] {v['package']} "
-                      f"{v['version']}  {v['id']}: {v['summary']}")
+                      f"{v['version']}{via}  {v['id']}: {v['summary']}")
         else:
             print("No known vulnerabilities in the offline DB. [OK]")
         if result["unpinned"]:

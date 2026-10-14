@@ -375,3 +375,171 @@ def test_run_min_severity_filters_vulnerabilities(tmp_path):
     f.write_text("jinja2==2.11.0\n")  # medium-severity advisory
     assert checker.run(str(f))["vulnerabilities"]
     assert checker.run(str(f), min_severity="high")["vulnerabilities"] == []
+
+
+# --- lockfiles (#53) ---------------------------------------------------------
+
+LOCK_V3 = json.dumps({
+    "lockfileVersion": 3,
+    "packages": {
+        "": {"name": "app", "dependencies": {"webpack": "^5.0.0"},
+             "devDependencies": {"axios": "^1.0.0"}},
+        "node_modules/webpack": {"version": "5.0.0",
+                                 "dependencies": {"terser": "^5.0.0"}},
+        "node_modules/terser": {"version": "5.0.0",
+                                "dependencies": {"lodash": "^4.17.0"}},
+        # hoisted: the path alone says nothing about who pulled it in
+        "node_modules/lodash": {"version": "4.17.15"},
+        # nested copy that webpack resolves before the hoisted one
+        "node_modules/webpack/node_modules/minimist": {"version": "1.2.5"},
+        "node_modules/axios": {"version": "1.6.0"},
+        "node_modules/@scope/pkg": {"version": "1.0.0"},
+    },
+})
+
+
+def test_package_lock_v3_reports_transitive_chain():
+    deps = {d.name: d for d in checker.parse_package_lock(LOCK_V3)}
+    assert deps["lodash"].version == "4.17.15"
+    assert deps["lodash"].via == "webpack > terser"
+    assert deps["minimist"].via == "webpack"
+    assert deps["webpack"].via is None and deps["axios"].via is None
+    assert deps["@scope/pkg"].version == "1.0.0"
+    assert all(d.pinned for d in deps.values())
+    lodash = next(f for f in checker.check_offline(list(deps.values()))
+                  if f.package == "lodash")
+    assert lodash.id == "CVE-2021-23337" and lodash.via == "webpack > terser"
+
+
+def test_package_lock_nested_version_resolves_before_hoisted():
+    lock = json.dumps({"packages": {
+        "": {"dependencies": {"webpack": "*", "lodash": "*"}},
+        "node_modules/webpack": {"version": "5.0.0",
+                                 "dependencies": {"lodash": "*"}},
+        "node_modules/webpack/node_modules/lodash": {"version": "4.17.15"},
+        "node_modules/lodash": {"version": "4.17.21"},
+    }})
+    findings = checker.check_offline(checker.parse_package_lock(lock))
+    assert [(f.version, f.via) for f in findings] == [("4.17.15", "webpack")]
+
+
+def test_package_lock_v1_dependencies_shape():
+    lock = json.dumps({"lockfileVersion": 1, "dependencies": {
+        "webpack": {"version": "4.0.0", "requires": {"terser": "^4"}},
+        "terser": {"version": "4.0.0", "requires": {"lodash": "^4"},
+                   "dependencies": {
+                       "lodash": {"version": "4.17.15"}}},
+        "lodash": {"version": "4.17.21"},
+    }})
+    deps = checker.parse_package_lock(lock)
+    vulnerable = [d for d in deps if (d.name, d.version) == ("lodash", "4.17.15")]
+    assert [d.via for d in vulnerable] == ["webpack > terser"]
+    assert next(d for d in deps if d.name == "webpack").via is None
+
+
+def test_package_lock_invalid_returns_empty():
+    assert checker.parse_package_lock("{not json") == []
+
+
+POETRY_LOCK = '''
+[[package]]
+name = "Flask"
+version = "0.12.2"
+description = "A simple framework"
+optional = false
+
+[package.dependencies]
+Jinja2 = ">=2.4"
+click = ">=2.0"
+
+[package.extras]
+dotenv = ["python-dotenv"]
+
+[[package]]
+name = "jinja2"
+version = "2.10.0"
+
+[package.dependencies]
+MarkupSafe = ">=0.23"
+
+[[package]]
+name = "markupsafe"
+version = "2.0.0"
+
+[metadata]
+lock-version = "2.0"
+python-versions = "^3.9"
+'''
+
+
+def _check_poetry(deps):
+    by_name = {d.name: d for d in deps}
+    assert set(by_name) == {"flask", "jinja2", "markupsafe"}
+    assert by_name["flask"].via is None
+    assert by_name["jinja2"].via == "flask"
+    assert by_name["markupsafe"].via == "flask > jinja2"
+    ids = {f.id: f.via for f in checker.check_offline(deps)}
+    assert ids == {"CVE-2018-1000656": None, "CVE-2020-28493": "flask"}
+
+
+def test_parse_poetry_lock():
+    _check_poetry(checker.parse_poetry_lock(POETRY_LOCK))
+
+
+def test_parse_poetry_lock_without_tomllib(monkeypatch):
+    # The built-in reader is what Python 3.9/3.10 use.
+    monkeypatch.setitem(sys.modules, "tomllib", None)
+    _check_poetry(checker.parse_poetry_lock(POETRY_LOCK))
+
+
+def test_lockfile_wins_over_manifest(tmp_path):
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"webpack": "^5.0.0"},
+                    "devDependencies": {"axios": "^1.0.0"}}))
+    (tmp_path / "package-lock.json").write_text(LOCK_V3)
+    result = checker.run(str(tmp_path))
+    assert [os.path.basename(f) for f in result["files"]] == ["package-lock.json"]
+    names = [v["package"] for v in result["vulnerabilities"]]
+    assert len(names) == len(set(names))
+    assert result["unpinned"] == []  # lockfile versions are exact
+
+
+def test_poetry_lock_dedupes_requirements(tmp_path):
+    (tmp_path / "poetry.lock").write_text(POETRY_LOCK)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\ndependencies = ["flask>=0.12"]\n')
+    (tmp_path / "requirements.txt").write_text("flask==0.12.2\nrequests>=2\n")
+    result = checker.run(str(tmp_path))
+    names = sorted(os.path.basename(f) for f in result["files"])
+    assert names == ["poetry.lock", "requirements.txt"]
+    flask = [v for v in result["vulnerabilities"] if v["package"] == "flask"]
+    assert len(flask) == 1
+    assert result["dependency_count"] == 4  # 3 locked + requests
+
+
+def test_cli_text_shows_via(tmp_path, capsys):
+    (tmp_path / "package-lock.json").write_text(LOCK_V3)
+    assert checker.main([str(tmp_path)]) == 1
+    assert "lodash 4.17.15 (via webpack > terser)" in capsys.readouterr().out
+
+
+def test_online_osv_batches_queries(monkeypatch):
+    calls = []
+
+    def fake_osv(url, body=None, timeout=10.0):
+        calls.append(url)
+        if url.endswith("querybatch"):
+            return {"results": [
+                {"vulns": [{"id": "GHSA-1"}]} if q["package"]["name"] == "pkg7"
+                else {} for q in body["queries"]]}
+        return {"id": "GHSA-1", "summary": "bad",
+                "database_specific": {"severity": "HIGH"}}
+
+    monkeypatch.setattr(checker, "_osv", fake_osv)
+    deps = [checker.Dep("npm", f"pkg{i % 10}", "1.0.0", "", True, "root")
+            for i in range(2500)]
+    findings = checker.check_online_osv(deps)
+    assert calls.count("https://api.osv.dev/v1/querybatch") == 3
+    assert calls.count("https://api.osv.dev/v1/vulns/GHSA-1") == 1
+    assert len(findings) == 250
+    assert findings[0].severity == "high" and findings[0].via == "root"

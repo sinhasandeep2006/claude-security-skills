@@ -42,7 +42,7 @@ the [changelog](CHANGELOG.md).
 | [prompt-injection-tester](skills/prompt-injection-tester) | Red-teams your own LLM app with a categorized payload library and canary detection, then scores resilience 0-100 | Canary harness |
 | [http-sec-audit](skills/http-sec-audit) | Checks HTTP security headers and cookie flags (CSP, HSTS, SameSite, …) and gives concrete fixes | urllib + pure core |
 | [jwt-inspector](skills/jwt-inspector) | Decodes and audits JWTs (alg=none, weak expiry, claim hygiene) and cracks weak HMAC secrets offline | HMAC + checks |
-| [dependency-check](skills/dependency-check) | Flags known-vulnerable and unpinned deps in `requirements.txt`, `package.json` and `pyproject.toml`; offline DB plus optional OSV.dev | Version matcher |
+| [dependency-check](skills/dependency-check) | Flags known-vulnerable and unpinned deps in `requirements.txt`, `package.json`, `pyproject.toml`, `package-lock.json` and `poetry.lock`; offline DB plus optional OSV.dev | Version matcher |
 | [dockerfile-scan](skills/dockerfile-scan) | Catches insecure Dockerfile patterns: running as root, `:latest` base images, `curl \| sh`, remote `ADD`, baked-in secrets | Dockerfile parser |
 | [cors-auditor](skills/cors-auditor) | Audits CORS config for wildcard-with-credentials, reflected origins, `null` origin and overly broad methods | Header analyzer |
 

@@ -43,7 +43,7 @@ línea exacta del diff del pull request. Detalles en el [changelog](CHANGELOG.md
 | [prompt-injection-tester](skills/prompt-injection-tester) | Somete tu propia aplicación LLM a una biblioteca de payloads clasificados con detección de canarios, y puntúa la resistencia de 0 a 100 | Harness de canarios |
 | [http-sec-audit](skills/http-sec-audit) | Revisa las cabeceras de seguridad HTTP y los flags de las cookies (CSP, HSTS, SameSite y demás) e indica qué corregir | urllib |
 | [jwt-inspector](skills/jwt-inspector) | Decodifica y audita JWT (alg=none, expiración demasiado larga, higiene de claims) y descifra secretos HMAC débiles sin conexión | HMAC y comprobaciones |
-| [dependency-check](skills/dependency-check) | Señala dependencias vulnerables y sin fijar en `requirements.txt`, `package.json` y `pyproject.toml`; base offline y, si quieres, OSV.dev | Comparador de versiones |
+| [dependency-check](skills/dependency-check) | Señala dependencias vulnerables y sin fijar en `requirements.txt`, `package.json`, `pyproject.toml`, `package-lock.json` y `poetry.lock`; base offline y, si quieres, OSV.dev | Comparador de versiones |
 | [dockerfile-scan](skills/dockerfile-scan) | Detecta patrones inseguros en Dockerfile: ejecución como root, imagen base `:latest`, `curl \| sh`, `ADD` remoto, secretos incrustados | Analizador de Dockerfile |
 | [cors-auditor](skills/cors-auditor) | Audita la configuración CORS: comodín junto a credenciales, Origin reflejado, origen `null`, métodos demasiado amplios | Analizador de cabeceras |
 

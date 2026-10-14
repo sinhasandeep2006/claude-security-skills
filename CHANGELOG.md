@@ -6,6 +6,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **`dependency-check` reads lockfiles.** `package-lock.json` (v1 `dependencies`, v2/v3 `packages`) and `poetry.lock` are parsed for the exact installed versions, including transitive dependencies no manifest names. A transitive finding says what pulled it in, e.g. `lodash 4.17.15 (via webpack > terser)`, and carries a `via` field in `--json`. When a lockfile sits next to its manifest the lockfile wins and no package is reported twice. `poetry.lock` uses `tomllib` on 3.11+ and a small built-in reader for the subset Poetry writes on 3.9 and 3.10. `--online` now sends `/v1/querybatch` requests of up to 1000 packages and fetches each advisory once, instead of one request per package (#53).
+
+---
+
 ## [1.3.0] — 2026-10-02
 
 ### Added

@@ -42,7 +42,7 @@ secret-scanner и sast-lite появляются во вкладке Security и
 | [prompt-injection-tester](skills/prompt-injection-tester) | Гоняет ваше собственное LLM-приложение по библиотеке пейлоадов с детектом канареек и выставляет устойчивость от 0 до 100 | Canary-харнесс |
 | [http-sec-audit](skills/http-sec-audit) | Проверяет HTTP-заголовки безопасности и флаги cookie (CSP, HSTS, SameSite и прочие) и говорит, что именно поправить | urllib |
 | [jwt-inspector](skills/jwt-inspector) | Разбирает и аудитит JWT (alg=none, слишком долгий срок жизни, гигиена claims) и офлайн подбирает слабые HMAC-секреты | HMAC и проверки |
-| [dependency-check](skills/dependency-check) | Отмечает уязвимые и незакреплённые зависимости в `requirements.txt`, `package.json` и `pyproject.toml`; офлайн-база, при желании OSV.dev | Сопоставление версий |
+| [dependency-check](skills/dependency-check) | Отмечает уязвимые и незакреплённые зависимости в `requirements.txt`, `package.json`, `pyproject.toml`, `package-lock.json` и `poetry.lock`; офлайн-база, при желании OSV.dev | Сопоставление версий |
 | [dockerfile-scan](skills/dockerfile-scan) | Ловит опасное в Dockerfile: запуск от root, базовый образ `:latest`, `curl \| sh`, удалённый `ADD`, зашитые секреты | Парсер Dockerfile |
 | [cors-auditor](skills/cors-auditor) | Разбирает настройки CORS: wildcard вместе с credentials, отражённый Origin, `null`-origin, слишком широкий список методов | Анализатор заголовков |
 
